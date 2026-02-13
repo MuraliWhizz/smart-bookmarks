@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { supabase } from '@/lib/supabase'
 import { motion, AnimatePresence } from 'framer-motion'
 import { 
@@ -13,7 +13,6 @@ import {
   Bookmark as BookmarkIcon,
   Globe,
   Zap,
-  Menu
 } from 'lucide-react'
 
 // --- Types ---
@@ -33,61 +32,104 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(true)
   const [isSubmitting, setIsSubmitting] = useState(false)
 
-  // 🔹 Check User Session on Mount
+  // Ref to track if we are currently mounted to prevent state updates on unmount
+  const isMounted = useRef(true)
+
+  //  Optimized Fetch Function (Memoized)
+  const fetchBookmarks = useCallback(async (userId: string) => {
+    if (!userId) return
+
+    try {
+      const { data, error } = await supabase
+        .from('bookmarks')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+      
+      if (error) throw error
+      if (isMounted.current && data) setBookmarks(data)
+    } catch (err) {
+      console.error('Error fetching bookmarks:', err)
+    } finally {
+      if (isMounted.current) setIsLoading(false)
+    }
+  }, [])
+
+  // Auth & Session Management (Runs Once)
   useEffect(() => {
-    const checkUser = async () => {
-      const { data: { session } } = await supabase.auth.getSession()
-      if (session?.user) {
-        setUser(session.user)
-        fetchBookmarks(session.user.id)
-      } else {
-        setIsLoading(false)
+    isMounted.current = true
+
+    const initializeSession = async () => {
+      try {
+        const { data: { session } } = await supabase.auth.getSession()
+        if (session?.user && isMounted.current) {
+          setUser(session.user)
+          fetchBookmarks(session.user.id)
+        } else if (isMounted.current) {
+          setIsLoading(false)
+        }
+      } catch (error) {
+        if (isMounted.current) setIsLoading(false)
       }
     }
-    checkUser()
+    
+    initializeSession()
 
+    // Auth State Listener
     const { data: authListener } = supabase.auth.onAuthStateChange((event, session) => {
       if (event === 'SIGNED_OUT') {
-        setUser(null)
-        setBookmarks([])
-        setIsLoading(false)
+        if (isMounted.current) {
+          setUser(null)
+          setBookmarks([])
+          setIsLoading(false)
+        }
       } else if (session?.user) {
-        setUser(session.user)
-        // If we just logged in, fetch bookmarks
-        if (!user) fetchBookmarks(session.user.id)
+        // Only fetch if the user ID has changed or if we don't have user set yet
+        setUser((prevUser: any) => {
+          if (prevUser?.id !== session.user.id) {
+             fetchBookmarks(session.user.id)
+             return session.user
+          }
+          return prevUser
+        })
       }
     })
 
     return () => {
+      isMounted.current = false
       authListener.subscription.unsubscribe()
     }
-  }, [user])
+  }, []) // Dependency Array is empty to prevent infinite loops!
 
-  // BroadcastChannel for Tab Sync
+  //  BroadcastChannel for Tab Sync (Optimized: Single Instance)
   const bcRef = useRef<BroadcastChannel | null>(null)
+  
   useEffect(() => {
     if (typeof window === 'undefined' || !('BroadcastChannel' in window)) return
-    bcRef.current = new BroadcastChannel('bookmarks_channel')
-    bcRef.current.onmessage = (ev) => {
-      if (ev.data?.type === 'refresh' && user) fetchBookmarks(user.id)
+    
+    // Only create channel if it doesn't exist
+    if (!bcRef.current) {
+      bcRef.current = new BroadcastChannel('bookmarks_channel')
+      bcRef.current.onmessage = (ev) => {
+        // We need the latest user from state here, so we use a ref or check fetchBookmarks directly
+        // Instead of relying on 'user' dependency, we'll trigger a refetch if user exists
+        if (ev.data?.type === 'refresh') {
+           supabase.auth.getSession().then(({data}) => {
+             if (data.session?.user) {
+               fetchBookmarks(data.session.user.id)
+             }
+           })
+        }
+      }
     }
+    
     return () => {
-      bcRef.current?.close()
-      bcRef.current = null
+      if (bcRef.current) {
+        bcRef.current.close()
+        bcRef.current = null
+      }
     }
-  }, [user])
-
-  // Fetch Bookmarks
-  const fetchBookmarks = async (userId: string) => {
-    const { data } = await supabase
-      .from('bookmarks')
-      .select('*')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-
-    if (data) setBookmarks(data)
-    setIsLoading(false)
-  }
+  }, [fetchBookmarks]) // Dependency on the memoized fetchBookmarks function
 
   // Add Bookmark
   const addBookmark = async (e: React.FormEvent) => {
@@ -104,38 +146,47 @@ export default function Home() {
     const tempId = Math.random().toString(36).substring(7)
     const newBookmark: Bookmark = { id: tempId, title, url: formattedUrl, user_id: user.id }
     
+    // Optimistic Update
     setBookmarks((prev) => [newBookmark, ...prev])
     setTitle('')
     setUrl('')
 
-    const { data, error } = await supabase
-      .from('bookmarks')
-      .insert([{ title, url: formattedUrl, user_id: user.id }])
-      .select()
+    try {
+      const { data, error } = await supabase
+        .from('bookmarks')
+        .insert([{ title, url: formattedUrl, user_id: user.id }])
+        .select()
 
-    if (error) {
+      if (error) {
+        throw error
+      } else if (data) {
+        // Replace temp ID with real ID
+        setBookmarks((prev) => prev.map(b => b.id === tempId ? data[0] : b))
+        bcRef.current?.postMessage({ type: 'refresh' })
+      }
+    } catch (error) {
       console.error('Error adding:', error)
+      // Rollback on error
       setBookmarks((prev) => prev.filter(b => b.id !== tempId))
-    } else if (data) {
-      setBookmarks((prev) => prev.map(b => b.id === tempId ? data[0] : b))
-      bcRef.current?.postMessage({ type: 'refresh' })
+    } finally {
+      setIsSubmitting(false)
     }
-    
-    setIsSubmitting(false)
   }
 
   //  Delete Bookmark
   const deleteBookmark = async (id: string) => {
     const previousBookmarks = bookmarks
+    // Optimistic Delete
     setBookmarks((prev) => prev.filter((b) => b.id !== id))
 
-    const { error } = await supabase.from('bookmarks').delete().eq('id', id)
-
-    if (error) {
-      console.error('Delete failed:', error)
-      setBookmarks(previousBookmarks)
-    } else {
+    try {
+      const { error } = await supabase.from('bookmarks').delete().eq('id', id)
+      if (error) throw error
       bcRef.current?.postMessage({ type: 'refresh' })
+    } catch (error) {
+      console.error('Delete failed:', error)
+      // Rollback on error
+      setBookmarks(previousBookmarks)
     }
   }
 
@@ -176,7 +227,7 @@ export default function Home() {
             onClick={() => supabase.auth.signInWithOAuth({ provider: 'google' })}
             className="group w-full flex items-center justify-center gap-3 bg-white text-black px-6 py-4 rounded-xl font-bold hover:bg-zinc-200 transition-all active:scale-95 shadow-lg shadow-white/10"
           >
-            <img src="https://www.svgrepo.com/show/475656/google-color.svg" className="w-6 h-6" alt="Google" />
+            <img src="https://www.svgrepo.com/show/475656/google-color.svg" className="w-6 h-6" alt="Google" loading="lazy" />
             <span>Sign in with Google</span>
           </button>
         </div>
@@ -261,7 +312,7 @@ export default function Home() {
            )}
 
            <motion.div layout className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-5">
-             <AnimatePresence mode='popLayout'>
+             <AnimatePresence mode='popLayout' initial={false}>
                {bookmarks.map((b) => (
                  <BookmarkCard key={b.id} data={b} onDelete={deleteBookmark} />
                ))}
@@ -320,6 +371,7 @@ function BookmarkCard({ data, onDelete }: { data: Bookmark, onDelete: (id: strin
                <img 
                  src={`https://www.google.com/s2/favicons?domain=${data.url}&sz=128`} 
                  alt="icon" 
+                 loading="lazy"
                  className="w-full h-full object-contain opacity-80 group-hover:opacity-100 transition-opacity"
                  onError={(e) => { (e.target as HTMLImageElement).src = 'https://www.svgrepo.com/show/508699/landscape-placeholder.svg' }}
                />
@@ -334,11 +386,6 @@ function BookmarkCard({ data, onDelete }: { data: Bookmark, onDelete: (id: strin
             </div>
           </div>
 
-          {/* DELETE BUTTON FIX: 
-            1. 'opacity-100' by default (for mobile/tablet).
-            2. 'lg:opacity-0 lg:group-hover:opacity-100' for desktop hover effect.
-            3. Added 'touch-manipulation' for better mobile response.
-          */}
           <div className="absolute top-2 right-2 md:relative md:top-0 md:right-0 z-20">
             <button
               onClick={handleDeleteClick}
@@ -353,7 +400,7 @@ function BookmarkCard({ data, onDelete }: { data: Bookmark, onDelete: (id: strin
           </div>
         </div>
 
-        {/* External Link Icon - Hidden on mobile to reduce clutter, visible on desktop hover */}
+        {/* External Link Icon */}
         <div className="hidden lg:block absolute top-5 right-5 z-0 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
              <ExternalLink className="w-4 h-4 text-zinc-600" />
         </div>
