@@ -63,7 +63,7 @@ export default function Home() {
     }
   }, [user])
 
-  // 🔹 BroadcastChannel for Tab Sync
+  // BroadcastChannel for Tab Sync
   const bcRef = useRef<BroadcastChannel | null>(null)
   useEffect(() => {
     if (typeof window === 'undefined' || !('BroadcastChannel' in window)) return
@@ -77,7 +77,7 @@ export default function Home() {
     }
   }, [user])
 
-  // 🔹 Fetch Bookmarks
+  // Fetch Bookmarks
   const fetchBookmarks = async (userId: string) => {
     const { data } = await supabase
       .from('bookmarks')
@@ -89,7 +89,7 @@ export default function Home() {
     setIsLoading(false)
   }
 
-  // 🔹 Add Bookmark
+  // Add Bookmark
   const addBookmark = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!title || !url || !user) return
@@ -124,7 +124,7 @@ export default function Home() {
     setIsSubmitting(false)
   }
 
-  // 🔹 Delete Bookmark
+  //  Delete Bookmark
   const deleteBookmark = async (id: string) => {
     const previousBookmarks = bookmarks
     setBookmarks((prev) => prev.filter((b) => b.id !== id))
@@ -139,7 +139,7 @@ export default function Home() {
     }
   }
 
-  // 🔹 Handle Logout
+  //  Handle Logout
   const handleLogout = async () => {
     await supabase.auth.signOut()
     setUser(null)
